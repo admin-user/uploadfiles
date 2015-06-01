@@ -1,0 +1,306 @@
+/* Copyright 2013 Chris Wilson
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+       http://www.apache.org/licenses/LICENSE-2.0
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+var audioContext = new AudioContext();
+var audioInput = null,
+    realAudioInput = null,
+    inputPoint = null,
+    audioRecorder = null;
+var rafID = null;
+var analyserContext = null;
+var canvasWidth, canvasHeight;
+var recIndex = 0;
+
+/* TODO:
+- offer mono option
+- "Monitor input" switch
+*/
+
+function saveAudio() {
+    audioRecorder.exportWAV( doneEncoding );
+    // could get mono instead by saying
+    // audioRecorder.exportMonoWAV( doneEncoding );
+}
+
+function drawWave( buffers ) {
+    var canvas = document.getElementById( "wavedisplay" );
+
+    drawBuffer( canvas.width, canvas.height, canvas.getContext('2d'), buffers[0] );
+}
+
+function doneEncoding( blob ) {
+    Recorder.forceDownload( blob, "myRecording" + ((recIndex<10)?"0":"") + recIndex + ".wav" );
+    recIndex++;
+}
+
+function toggleRecording( e ) {
+    if (e.classList.contains("recording")) {
+        // stop recording
+        audioRecorder.stop();
+        e.classList.remove("recording");
+        audioRecorder.getBuffers( drawWave );
+    } else {
+        // start recording
+        if (!audioRecorder)
+            return;
+        e.classList.add("recording");
+        audioRecorder.clear();
+        audioRecorder.record();
+    }
+}
+
+function convertToMono( input ) {
+    var splitter = audioContext.createChannelSplitter(2);
+    var merger = audioContext.createChannelMerger(2);
+
+    input.connect( splitter );
+    splitter.connect( merger, 0, 0 );
+    splitter.connect( merger, 0, 1 );
+    return merger;
+}
+
+function cancelAnalyserUpdates() {
+    window.webkitCancelAnimationFrame( rafID );
+    rafID = null;
+}
+
+var codes = {
+	"1": [697, 1209, "EMERGENCY!"],
+        "2": [697, 1336, "Are you OK?"],
+        "3": [697, 1477, "I'm OK/Affirmative."],
+	"A": [697, 1633, "Negative."],
+        "4": [770, 1209, "Need help, non emergency."],
+        "5": [770, 1336, "Found something neat."],
+        "6": [770, 1477, "I'm lost."],
+	"B": [770, 1633, "I'm done/ready."],
+        "7": [852, 1209, "I need more time."],
+        "8": [852, 1336, "Boat is moving."],
+        "9": [852, 1477, "Let's go this way."],
+	"C": [852, 1633, "I am low on air."],
+        "0": [941, 1336, "Take a picture."],
+	"D": [941, 1633, "I need to poop."],
+	"*": [941, 1209, "Get to the choppa!"],
+	"#": [941, 1477, "Sharknado!"]
+}
+var counters = {
+	"1": 0,
+	"2": 0,
+	"3": 0,
+	"4": 0,
+	"5": 0,
+	"6": 0,
+	"7": 0,
+	"8": 0,
+	"9": 0,
+	"0": 0,
+	"A": 0,
+	"B": 0,
+	"C": 0,
+	"D": 0,
+	"*": 0,
+	"#": 0
+}
+
+var smoothSpectrum = [];
+for (i=0; i<1024; i++) smoothSpectrum[i] = 0;
+
+var frequencies = [697, 770, 852, 941, 1209, 1366, 1477, 1633];
+var sPrev = {};
+var sPrev2 = {};
+var totalPower = {};
+var N = {};
+var n = {};
+var average = {};
+var sumX2 = {};
+var sumX = {};
+for (i=0; i<frequencies.length; i++) {
+	freq = frequencies[i];
+	sPrev[freq] = [0, 0];
+	sPrev2[freq] = [0, 0];
+	totalPower[freq] = [0, 0];
+	N[freq] = 0;
+	n[freq] = [0, 0];
+	average[freq] = 0;
+	sumX[freq] = 0;
+	sumX2[freq] = 0;
+}
+
+function tandemRTgoertzelFilter(sample, freq, sampleFrequency) {
+    var coeff, normalizedfreq, power, s, active;
+    var RESETSAMPLES = 2;
+    normalizedfreq = freq / sampleFrequency;
+    coeff = 2*Math.cos(2*Math.PI*normalizedfreq);
+    s = sample + coeff * sPrev[freq][0] - sPrev2[freq][0];
+    sPrev2[freq][0] = sPrev[freq][0];
+    sPrev[freq][0] = s;
+    n[freq][0]++;
+    s = sample + coeff * sPrev[freq][1] - sPrev2[freq][1];
+    sPrev2[freq][1] = sPrev[freq][1];
+    sPrev[freq][1] = s;    
+    n[freq][1]++;
+    N[freq]++;
+    active = (N[freq] / RESETSAMPLES) & 0x01;
+    if  (n[freq][1-active] >= RESETSAMPLES) { // reset inactive
+        sPrev[freq][1-active] = 0.0;
+        sPrev2[freq][1-active] = 0.0;  
+        totalPower[freq][1-active] = 0.0;  
+        n[freq][1-active]=0;    
+    }
+    totalPower[freq][0] += sample*sample;
+    totalPower[freq][1] += sample*sample;
+    power = sPrev2[freq][active]*sPrev2[freq][active]+sPrev[freq][active]
+       * sPrev[freq][active]-coeff*sPrev[freq][active]*sPrev2[freq][active];
+    return power / (totalPower[freq][active]+1e-7) / n[freq][active];
+}
+
+var lowFreqCount = {697:0, 770:0, 852:0, 941:0};
+var highFreqCount = {1209:0, 1366:0, 1477:0, 1633:0};
+var smoothDTMF = {697:0, 770:0, 852:0, 941:0, 1209:0, 1366:0, 1477:0, 1633:0};
+
+
+function updateAnalysers(time) {
+    if (!analyserContext) {
+        var canvas = document.getElementById("analyser");
+        canvasWidth = canvas.width;
+        canvasHeight = canvas.height;
+        analyserContext = canvas.getContext('2d');
+    }
+
+    // analyzer draw code here
+    {
+        var SPACING = 3;
+        var BAR_WIDTH = 1;
+        var numBars = Math.round(canvasWidth / SPACING);
+        var freqByteData = new Uint8Array(analyserNode.frequencyBinCount);
+
+        analyserNode.getByteFrequencyData(freqByteData); 
+
+	// smooth spectrum
+	smoothing = 0.01;
+	for (i=0; i<1024; i++) {
+		smoothSpectrum[i] = ((1-smoothing)*smoothSpectrum[i]+smoothing*freqByteData[i]);
+	}
+	//freqByteData = smoothSpectrum;
+
+	// frequency of each bin:
+	// i * sampleRate / fftSize = freq
+	// i * analyserNode.context.sampleRate
+	//function tandemRTgoertzelFilter(sample, freq, sampleFrequency) {
+	// low frequencies
+	for (var k=0; k<4; k++) {
+		freq = frequencies[k];
+		i = Math.round(freq * analyserNode.fftSize / analyserNode.context.sampleRate);
+		power = tandemRTgoertzelFilter(freqByteData[i], freq, analyserNode.context.sampleRate);
+
+		smoothing = 0.05;
+		smoothDTMF[freq] = (1-smoothing)*smoothDTMF[freq] + smoothing*power;
+		if ((N[freq] > 200) && (power > smoothDTMF[freq])) {
+			lowFreqCount[freq] += 1;
+			if (lowFreqCount[freq] > 10) {
+				console.log(freq);
+			}
+		} else {
+			lowFreqCount[freq] = 0;
+		}
+	}
+
+	/*
+	factor = 1;
+	delay = 70;
+	function detect(frequency) {
+		i = Math.round(frequency * analyserNode.fftSize / analyserNode.context.sampleRate);
+		//return ((freqByteData[i] > factor*freqByteData[i+1]) || (freqByteData[i] > factor*freqByteData[i-1]));
+		return (freqByteData[i] > factor*0.5*(freqByteData[i+1]+freqByteData[i-1]));
+	}
+	for (code in codes) {
+		freqs = codes[code];
+		if (detect(freqs[0]) && detect(freqs[1])) {
+			counters[code] += 1;
+			if (counters[code] > delay) {
+				var node = document.getElementById("code");
+				node.innerHTML = "<b>" + freqs[2] + "</b>";
+			}
+		} else {
+			counters[code] = 0;
+		}
+	}
+	*/
+
+        analyserContext.clearRect(0, 0, canvasWidth, canvasHeight);
+        analyserContext.fillStyle = '#F6D565';
+        analyserContext.lineCap = 'round';
+        var multiplier = analyserNode.frequencyBinCount / numBars;
+
+        // Draw rectangle for each frequency bin.
+        for (var i = 0; i < numBars; ++i) {
+            var magnitude = 0;
+            var offset = Math.floor( i * multiplier );
+            // gotta sum/average the block, or we miss narrow-bandwidth spikes
+            for (var j = 0; j< multiplier; j++)
+                magnitude += freqByteData[offset + j];
+            magnitude = magnitude / multiplier;
+            var magnitude2 = freqByteData[i * multiplier];
+            analyserContext.fillStyle = "hsl( " + Math.round((i*360)/numBars) + ", 100%, 50%)";
+            analyserContext.fillRect(i * SPACING, canvasHeight, BAR_WIDTH, -magnitude);
+        }
+    }
+    
+    rafID = window.webkitRequestAnimationFrame( updateAnalysers );
+}
+
+function toggleMono() {
+    if (audioInput != realAudioInput) {
+        audioInput.disconnect();
+        realAudioInput.disconnect();
+        audioInput = realAudioInput;
+    } else {
+        realAudioInput.disconnect();
+        audioInput = convertToMono( realAudioInput );
+    }
+
+    audioInput.connect(inputPoint);
+}
+
+function gotStream(stream) {
+    inputPoint = audioContext.createGain();
+
+    // Create an AudioNode from the stream.
+    realAudioInput = audioContext.createMediaStreamSource(stream);
+    audioInput = realAudioInput;
+    audioInput.connect(inputPoint);
+
+//    audioInput = convertToMono( input );
+
+    analyserNode = audioContext.createAnalyser();
+    analyserNode.fftSize = 2048;
+    inputPoint.connect( analyserNode );
+
+    audioRecorder = new Recorder( inputPoint );
+
+    zeroGain = audioContext.createGain();
+    zeroGain.gain.value = 0.0;
+    inputPoint.connect( zeroGain );
+    zeroGain.connect( audioContext.destination );
+    updateAnalysers();
+}
+
+function initAudio() {
+        if (!navigator.getUserMedia)
+            navigator.getUserMedia = navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+
+    navigator.getUserMedia({audio:true}, gotStream, function(e) {
+            alert('Error getting audio');
+            console.log(e);
+        });
+}
+
+window.addEventListener('load', initAudio );
